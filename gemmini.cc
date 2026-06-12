@@ -13,6 +13,32 @@ REGISTER_EXTENSION(gemmini, []() { return new gemmini_t; })
 
 #define dprintf(...) { if (p->get_log_commits_enabled()) printf(__VA_ARGS__); }
 
+// --- FAITHFUL-CYCLE MODEL (opt-in via GEMMINI_FAITHFUL_CYCLES=1) ---------------
+// The base spike model retires every accelerator op in ~1 instruction (CPI=1, no
+// latency) -> read_cycles is ~the host instruction count and UNDERCOUNTS real RTL
+// by ~20-40x for accel-bound kernels, which makes autocomp chase instruction-count
+// tricks (mvin batching, fence removal) that don't help silicon. When enabled, we
+// bump the cycle CSR by a DATA-driven latency calibrated to VCS: per-mvin ~ bytes
+// moved (cols*rows), per loop_ws ~ MACs/peak. Coefficients fit to VCS cycle data
+// (fp8-64/256, fp4/fp6-512) within +/-17%. Cycle-only -> NEVER affects functional
+// correctness. Recalibrate K_DMA/K_CMP from a VCS shape-suite when the RTL changes
+// (see autocomp cost_model.py fit). Numerator/1000 keeps it integer.
+#define GMX_K_DMA_MILLI_DEFAULT 143    /* cycles per byte moved (mvin/mvout)  */
+#define GMX_K_CMP_MILLI_DEFAULT 1804   /* cycles per (MAC/peak) compute unit  */
+static inline bool gmx_faithful_cycles() {
+  static int v = -1;
+  if (v < 0) v = getenv("GEMMINI_FAITHFUL_CYCLES") ? 1 : 0;
+  return v;
+}
+// Coefficients are env-overridable so the RTL->spike auto-calibration harness can update them
+// WITHOUT recompiling libgemmini (it just exports GEMMINI_K_DMA_MILLI / GEMMINI_K_CMP_MILLI).
+static inline long gmx_k_dma() {
+  static long v = -1; if (v < 0) { const char* e = getenv("GEMMINI_K_DMA_MILLI"); v = e ? atol(e) : GMX_K_DMA_MILLI_DEFAULT; } return v;
+}
+static inline long gmx_k_cmp() {
+  static long v = -1; if (v < 0) { const char* e = getenv("GEMMINI_K_CMP_MILLI"); v = e ? atol(e) : GMX_K_CMP_MILLI_DEFAULT; } return v;
+}
+
 void gemmini_state_t::reset()
 {
   enable = true;
@@ -58,6 +84,7 @@ void gemmini_state_t::reset()
   mx_loop_a_spad = mx_loop_b_spad = mx_loop_c_spad = 0;
   mx_loop_skips = 0;
   mx_loop_spad_marker = false;
+  loop_input_alt_port = false;
   mx_scale_a_mem.clear(); mx_scale_a_mem.resize(8192, 0x7f);
   mx_scale_b_mem.clear(); mx_scale_b_mem.resize(8192, 0x7f);
   mx_smem.clear(); mx_smem.resize(sp_matrices * DIM * 16, 0);
@@ -136,11 +163,41 @@ void gemmini_t::write_to_dram(reg_t addr, T data) {
 // Move a gemmini block from DRAM at dram_addr (byte addr) to
 // the scratchpad/accumulator at sp_addr (gemmini-row addressed)
 void gemmini_t::mvin(reg_t dram_addr, reg_t sp_addr, int state_id) {
+  // task #38: spike writes all mvin ports into one unified scratchpad (port-agnostic),
+  // but the RTL routes mvin2/mvin3 (port!=0) to a distinct physical region that the
+  // loop_ws B/A-read port (selected by a_spad_id/b_spad_id) does not see. So a loop_ws
+  // input loaded via a non-zero port is spike-correct but RTL-wrong. Track it for the guard.
+  if (state_id != 0) gemmini_state.loop_input_alt_port = true;
   bool const accumulator = (sp_addr >> 31) & 0x1;
   bool const accumulate = (sp_addr >> 30) & 0x1;
   auto const base_row_addr = (sp_addr & 0x1FFFFFFF); // Strip accumulator addressing bits [31:29]
-  auto const cols = (sp_addr >> addr_len) & 0xFFFF;
-  auto const rows = (sp_addr >> (addr_len + 16)) & 0xFFFF;
+  auto const cols_raw = (sp_addr >> addr_len) & 0xFFFF;
+  auto const rows_raw = (sp_addr >> (addr_len + 16)) & 0xFFFF;
+
+  // RTL fidelity: the mvin num_cols AND num_rows fields are only GEMMINI_DMA_DIM_BITS
+  // wide in the ELABORATED hardware. For RadianceGemminiOnlyConfig the LoadController
+  // reads cols from rs2[37:32] and rows from rs2[53:48] -- both 6-bit fields (see
+  // generated LoadController.sv:220 "{6'h0, rs2[37:32]} * actual_rows_read", :209
+  // "actual_rows_read = ... rs2[53:48]" (wire [5:0]), :448). The mvin macros pack a
+  // full 16-bit cols<<ADDR_LEN and rows<<(ADDR_LEN+16), so any value that does not
+  // fit is SILENTLY TRUNCATED by hardware (e.g. cols=64=2^6 -> rs2[37:32]=64&0x3F=0).
+  // We model that truncation here so spike matches the RTL bit-for-bit: cols/rows
+  // that overflow the field collapse to val&mask, and cols=64 -> 0 then trips the
+  // "bytes>0" assert below exactly as VCS does at LoadController.scala:191.
+  // NOTE: gemmini_params.h MAX_BYTES=64 (=> MAX_BLOCK_LEN=4 => cols up to 64) is
+  // INCONSISTENT with this 6-bit field (max cols 63 => max block batch 3); the
+  // hardware field width is authoritative. 6 is config-specific -- re-derive from
+  // the generated RTL (rs2[hi:32]/rs2[hi:48] slice widths) for other Gemmini configs.
+  // StoreController (mvout) uses the SAME 6-bit slices -- see gemmini_t::mvout.
+  const unsigned MVIN_COLS_BITS = 6;
+  auto const cols = cols_raw & ((1u << MVIN_COLS_BITS) - 1);
+  auto const rows = rows_raw & ((1u << MVIN_COLS_BITS) - 1);
+
+  // faithful-cycle model: DMA latency ~ bytes moved (cols*rows). Summed over all mvins
+  // this is the total load bytes REGARDLESS of batching -> batch-2/batch-1 cost the same
+  // (the instruction-count "win" vanishes, matching RTL where the ROB already overlaps).
+  if (gmx_faithful_cycles())
+    p->get_state()->mcycle->bump((reg_t)((uint64_t)cols * rows * gmx_k_dma() / 1000));
 
   bool is_zeros = dram_addr == 0;
 
@@ -153,6 +210,67 @@ void gemmini_t::mvin(reg_t dram_addr, reg_t sp_addr, int state_id) {
   auto const pixels_per_row = gemmini_state.pixels_per_rows[state_id];
 
   dprintf("GEMMINI: mvin - 0x%02lx cols and 0x%02lx rows from 0x%08lx to addr 0x%08lx\n", cols, rows, dram_addr, sp_addr & 0xFFFFFFFF);
+
+  // --- RTL-fidelity instrumentation / legality guards ----------------------
+  // The spike model is a generic, permissive ISA functional model; the real RTL
+  // ($fatal-guards in generators/gemmini/src/main/scala/gemmini/LoadController.scala)
+  // rejects encodings spike silently accepts. GEMMINI_MVIN_TRACE dumps the decoded
+  // fields so we can calibrate the EXACT legal envelope against VCS; the guards are
+  // toggleable via GEMMINI_RTL_ASSERTS_OFF so an illegal kernel can run to completion
+  // for full tracing. See MX_AUTOCOMP_STATUS.md sec 4c.
+  static const bool mvin_trace = getenv("GEMMINI_MVIN_TRACE") != nullptr;
+  static const bool rtl_asserts_off = getenv("GEMMINI_RTL_ASSERTS_OFF") != nullptr;
+  if (mvin_trace) {
+    printf("MVIN_TRACE state=%d cols=%lu(raw=%lu) rows=%lu block_stride=%lu blocks=%lu "
+           "dram=0x%lx sp=0x%lx accumulator=%d\n",
+           state_id, (unsigned long)cols, (unsigned long)cols_raw, (unsigned long)rows,
+           (unsigned long)load_block_stride,
+           (unsigned long)((cols + DIM - 1) / DIM),
+           (unsigned long)dram_addr, (unsigned long)(sp_addr & 0xFFFFFFFF),
+           (int)accumulator);
+  }
+  // cols field overflow: cols_raw did not fit in the MVIN_COLS_BITS-wide hardware
+  // field and was truncated. This is the ROOT CAUSE of the autocomp "winner"
+  // VCS fatals: MAX_BLOCK_LEN=4 produced cols=64, which the 6-bit field reads as
+  // 0. Surface it explicitly (the truncated `cols` is what the loop below uses,
+  // so spike already diverges the same way the RTL does).
+  if (cols_raw != cols) {
+    printf("GEMMINI MVIN ILLEGAL: cols=%lu overflows the %u-bit hardware num_cols "
+           "field (rs2[%u:32]) -> truncated to %lu. Reduce block batch so "
+           "cols=batch*DIM <= %u (max block batch %u). -- RTL LoadController.sv cols field\n",
+           (unsigned long)cols_raw, MVIN_COLS_BITS, 31 + MVIN_COLS_BITS,
+           (unsigned long)cols, (1u << MVIN_COLS_BITS) - 1,
+           ((1u << MVIN_COLS_BITS) - 1) / (unsigned)DIM);
+    if (!rtl_asserts_off) exit(1);
+  }
+  if (rows_raw != rows) {
+    printf("GEMMINI MVIN ILLEGAL: rows=%lu overflows the %u-bit hardware num_rows "
+           "field (rs2[%u:48]) -> truncated to %lu (max rows %u). -- RTL LoadController.sv:209 rows field\n",
+           (unsigned long)rows_raw, MVIN_COLS_BITS, 47 + MVIN_COLS_BITS,
+           (unsigned long)rows, (1u << MVIN_COLS_BITS) - 1);
+    if (!rtl_asserts_off) exit(1);
+  }
+  // RTL LoadController.scala:191 -- "A single mvin instruction must load > 0 bytes".
+  // Uses the TRUNCATED cols (== bytes_to_read==0 condition in RTL): e.g. cols=64
+  // -> field 0 -> 0 bytes -> $fatal. This is the assert the fp8-256 winner hit.
+  if (rows == 0 || cols == 0) {
+    printf("GEMMINI MVIN ILLEGAL: zero-byte mvin (rows=%lu cols=%lu, cols_raw=%lu) -- RTL LoadController.scala:191\n",
+           (unsigned long)rows, (unsigned long)cols, (unsigned long)cols_raw);
+    if (!rtl_asserts_off) exit(1);
+  }
+  // RTL LoadController.scala:138 -- assert(block_stride >= rows). A block/wide mvin
+  // (cols>DIM) packs ceil(cols/DIM) blocks into the scratchpad block_stride rows apart;
+  // if block_stride < rows the per-block rows overlap and the RTL $fatals. NOTE: the
+  // exact predicate here is being calibrated against VCS (see task #35); refine if VCS
+  // shows a wider/narrower legal envelope on RadianceGemminiOnlyConfig.
+  else if (cols > (size_t)DIM && load_block_stride < rows) {
+    printf("GEMMINI MVIN ILLEGAL: block mvin with block_stride(%lu) < rows(%lu) "
+           "(cols=%lu, blocks=%lu) -- RTL LoadController.scala:138 assert(block_stride>=rows). "
+           "Configure gemmini_extended4_config_ld(..., block_mvin_stride>=rows, ...).\n",
+           (unsigned long)load_block_stride, (unsigned long)rows,
+           (unsigned long)cols, (unsigned long)((cols + DIM - 1) / DIM));
+    if (!rtl_asserts_off) exit(1);
+  }
 
   for (size_t row = 0; row < rows; ++row) {
     auto const dram_row_addr = dram_addr + row*load_stride;
@@ -241,12 +359,34 @@ void gemmini_t::mvout(reg_t dram_addr, reg_t sp_addr) {
   bool const full = (sp_addr >> 29) & 0x1;
   auto const norm_cmd = static_cast<gemmini_state_t::NormCmd>((sp_addr >> 26) & 0x7);
   auto const base_row_addr = (sp_addr & 0x3FFFFFF); // Strip accumulator addressing bits [31:26]
-  auto const cols = (sp_addr >> addr_len) & 0xFFFF;
-  auto const rows = (sp_addr >> (addr_len + 16)) & 0xFFFF;
+  auto const cols_raw = (sp_addr >> addr_len) & 0xFFFF;
+  auto const rows_raw = (sp_addr >> (addr_len + 16)) & 0xFFFF;
+
+  // RTL fidelity (mirrors gemmini_t::mvin): the StoreController mvout num_cols and
+  // num_rows fields are only 6 bits wide -- cols=rs2[37:32], rows=rs2[53:48] (see
+  // generated StoreController.sv:208 "rs2[37:32] % 16", :248/:459 "rs2[53:48]").
+  // The mvout macros pack a full 16-bit cols<<ADDR_LEN / rows<<(ADDR_LEN+16), so any
+  // value > 63 is SILENTLY TRUNCATED by hardware. Model that here so a kernel that
+  // overflows the field diverges on spike the same way it does on the RTL. All
+  // current MX kernels mvout cols=rows=DIM(16) (safe); this guards future block-mvout
+  // search transforms. 6 is config-specific (re-derive from generated RTL slices).
+  const unsigned MVOUT_DIM_BITS = 6;
+  auto const cols = cols_raw & ((1u << MVOUT_DIM_BITS) - 1);
+  auto const rows = rows_raw & ((1u << MVOUT_DIM_BITS) - 1);
 
   const int block_stride = DIM;
 
   dprintf("GEMMINI: mvout - 0x%02lx cols and 0x%02lx rows from 0x%08lx to addr 0x%08lx\n", cols, rows, sp_addr, dram_addr);
+
+  static const bool mvout_asserts_off = getenv("GEMMINI_RTL_ASSERTS_OFF") != nullptr;
+  if (cols_raw != cols || rows_raw != rows) {
+    printf("GEMMINI MVOUT ILLEGAL: cols=%lu/rows=%lu overflow the 6-bit hardware "
+           "mvout fields (rs2[37:32]/rs2[53:48]) -> truncated to cols=%lu/rows=%lu "
+           "(max 63 each). -- RTL StoreController.sv cols/rows fields\n",
+           (unsigned long)cols_raw, (unsigned long)rows_raw,
+           (unsigned long)cols, (unsigned long)rows);
+    if (!mvout_asserts_off) exit(1);
+  }
 
   if (gemmini_state.pool_stride == 0) {
     for (size_t i = 0; i < rows; ++i) {
@@ -1135,12 +1275,37 @@ void gemmini_t::mx_loop_ws_spad(reg_t rs1, reg_t rs2) {
   gemmini_state.mx_loop_skips = (uint8_t)(rs2 & 0x3F);
   (void)rs1;
 
+  // task #38: RTL-fidelity guard. A loop_ws input loaded via mvin2/mvin3 (port!=0) lands in a
+  // physical scratchpad region the loop_ws read ports (a_spad_id/b_spad_id, both 0 in the MX
+  // path) do not address on the elaborated RTL -> the loop reads stale/wrong data and the kernel
+  // produces WRONG results on VCS, while spike's unified scratchpad reads it fine. This is exactly
+  // the fp8-128 autocomp "winner" (B via mvin2): spike-correct, VCS-wrong. Reject it so spike is
+  // faithful (use single-port gemmini_extended_mvin for loop_ws inputs). Env-gated like mvin guards.
+  if (gemmini_state.loop_input_alt_port) {
+    static const bool rtl_off = getenv("GEMMINI_RTL_ASSERTS_OFF") != nullptr;
+    printf("GEMMINI LOOP_WS ILLEGAL: a loop_ws input was loaded via mvin2/mvin3 (port != 0); the MX "
+           "loop_ws_spad reads A/B from the port-0 scratchpad region on RTL, so this is spike-correct "
+           "but RTL-WRONG (the fp8-128 dual-port-B winner). Use single-port gemmini_extended_mvin for "
+           "loop_ws inputs. -- spike<->RTL dual-port divergence (task #38)\n");
+    if (!rtl_off) exit(1);
+  }
+
   const uint32_t C_spad = (uint32_t)((rs2 >> 32) & 0xFFFFFFFFu);
   const uint16_t TI = gemmini_state.loop_ws_I;
   const uint16_t TJ = gemmini_state.loop_ws_J;
   const uint16_t TK = gemmini_state.loop_ws_K;
   const uint32_t A_sp = gemmini_state.mx_loop_a_spad;
   const uint8_t actf = gemmini_state.mx_act_fmt;
+
+  // faithful-cycle model: systolic compute latency ~ MACs/peak. compute_term = MACs/peak:
+  // fp8 (actf==0): 16-wide tiles, peak 256 -> TI*TJ*TK*16; sub-byte fp6/fp4: 32-wide tiles,
+  // peak 512 -> TI*TJ*TK*32 (both verified against the real MACs/peak). Placed before the
+  // early returns so it counts on every datapath. Overlap with loads is absorbed into the
+  // fitted coefficients (the model reproduces RTL totals on the calibration kernels).
+  if (gmx_faithful_cycles()) {
+    uint64_t cmp_term = (uint64_t)TI * TJ * TK * (actf == 0 ? 16 : 32);
+    p->get_state()->mcycle->bump((reg_t)(cmp_term * gmx_k_cmp() / 1000));
+  }
 
   const int prod_e = 4, prod_m = 3;
   const int8_t acc_e[16] = {4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,8};
@@ -1194,6 +1359,47 @@ void gemmini_t::mx_loop_ws_spad(reg_t rs1, reg_t rs2) {
       }
     }
 
+    // HW MX SOFTMAX pass (act == SOFTMAX): the MX matmul output in mx_smem is the
+    // attention score row; apply the I-BERT integer softmax in-place (per output row,
+    // over all N_DIM cols) BEFORE the requant post-pass, so the requant then encodes the
+    // probabilities P directly to fp8. This models the RTL Normalizer(MAX/SUM_EXP/iexp) +
+    // AccumulatorScale(iexp) path being enabled for MX (has_normalizations/
+    // has_nonlinear_activations). For one QK loop_ws_spad N_DIM == ATT_S (full row), so this
+    // is the true attention softmax. Numerics are the VALIDATED host integer softmax: bf16
+    // score -> Q(1/1024) -> iexp (z>=63 guard) -> normalize. Constants come from
+    // gemmini_config_norm (qln2/qln2_inv/qb/qc); default to the validated set if unset.
+    // NOTE (RTL-fidelity): the RTL iexp consumes the acc value AS the q-domain operand, so on
+    // hardware the QK output must be pre-scaled into the q-domain (S_q=1/1024). Spike does the
+    // q-conversion here (round(score*1024)) to match the validated host path; the kernel-side
+    // q-domain scaling is the open numeric design point for the RTL build (task #50).
+    if (gemmini_state.acc_act == gemmini_state_t::SOFTMAX) {
+      const int64_t QLN2     = gemmini_state.qln2     ? (int64_t)(uint32_t)gemmini_state.qln2     : 710;
+      const int64_t QLN2_INV = gemmini_state.qln2_inv ? (int64_t)(uint32_t)gemmini_state.qln2_inv : 92;
+      const int64_t QB       = gemmini_state.igelu_qb ? (int64_t)(uint32_t)gemmini_state.igelu_qb : 1385;
+      const int64_t QC       = gemmini_state.igelu_qc ? (int64_t)(uint32_t)gemmini_state.igelu_qc : 1006165;
+      auto ibert_iexp = [&](int64_t qa) -> int64_t {          // qa <= 0
+        int64_t z  = (-qa * QLN2_INV) >> 16;
+        int64_t qp = qa + z * QLN2;
+        int64_t qe = (qp + QB) * (qp + QB) + QC;
+        if (z >= 63) return 0;                                // shift-UB guard (validated fix)
+        return qe >> z;
+      };
+      for (int m = 0; m < M_DIM; m++) {
+        std::vector<int64_t> q(N_DIM); int64_t mq = -((int64_t)1 << 62);
+        for (int j = 0; j < N_DIM; j++) {
+          float v = bf16_to_f32(gemmini_state.mx_smem[smem_base + (size_t)m * N_DIM + j]);
+          int64_t qq = (int64_t)llroundf(v * 1024.0f);        // Q(1/1024), matches mx_ibf16_to_q
+          q[j] = qq; if (qq > mq) mq = qq;
+        }
+        std::vector<int64_t> p(N_DIM); int64_t sum = 0;
+        for (int j = 0; j < N_DIM; j++) { int64_t pv = ibert_iexp(q[j] - mq); p[j] = pv; sum += pv; }
+        if (sum == 0) sum = 1;
+        for (int j = 0; j < N_DIM; j++)                       // store normalized prob as bf16; requant encodes to fp8
+          gemmini_state.mx_smem[smem_base + (size_t)m * N_DIM + j] =
+              f32_to_bf16_rne((float)p[j] / (float)sum);
+      }
+    }
+
     // FP8 requant post-pass: when out_mx_fmt == 0 (FP8 E4M3) we replace the BF16
     // tile contents in-place with packed FP8 codes (2 per uint16_t) and emit
     // per-row per-N-group e8m0 scale codes to user DRAM at mx_scale_dram.
@@ -1215,7 +1421,12 @@ void gemmini_t::mx_loop_ws_spad(reg_t rs1, reg_t rs2) {
             scale_code = 0;
           } else {
             int max_exp = (int)floorf(log2f(max_abs));
-            int scale_exp = max_exp - 8;
+            // Normal MX matmul targets the group-max to ~2^8 (near fp8 max). But when this output
+            // is a softmax result that will be the A-operand of a following MX matmul (attention P@V),
+            // P must land at ~2^MX_P_TARGET_LOG2(=4), not 2^8, or it overflows the e4 block accumulator
+            // in the P@V matmul (the MX_P_TARGET_LOG2 lesson). Gate on the softmax activation.
+            int target = (gemmini_state.acc_act == gemmini_state_t::SOFTMAX) ? 4 : 8;
+            int scale_exp = max_exp - target;
             int s = scale_exp + 127;
             if (s < 0) s = 0;
             if (s > 254) s = 254;
@@ -2104,6 +2315,12 @@ reg_t gemmini_t::CUSTOMFN(XCUSTOM_ACC)(rocc_insn_t insn, reg_t xs1, reg_t xs2) {
   //==========================================================================
   else if (insn.funct == flush_funct) {
     dprintf("GEMMINI: flush\n");
+    // flush resets accelerator state; the MX shared memory accumulates
+    // (bf16_accum_add) so it MUST be cleared here, else software-tiled matmuls
+    // that issue one loop_ws_spad per output block pile each block onto the
+    // previous block's smem residue. (reset() clears it, but only runs once.)
+    std::fill(gemmini_state.mx_smem.begin(), gemmini_state.mx_smem.end(), 0);
+    gemmini_state.loop_input_alt_port = false;   // new matmul: clear the dual-port-input tracker (task #38)
   } else if (insn.funct == fence_funct) {
     dprintf("GEMMINI: fence\n");
   } else {

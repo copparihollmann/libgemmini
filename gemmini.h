@@ -126,6 +126,7 @@ struct gemmini_state_t
   uint32_t mx_loop_c_spad;
   uint8_t  mx_loop_skips;
   bool     mx_loop_spad_marker;
+  bool     loop_input_alt_port;   // set if a loop_ws input was mvin'd via port!=0 (mvin2/mvin3); RTL-divergent (task #38)
 
   std::vector<uint8_t> mx_scale_a_mem;
   std::vector<uint8_t> mx_scale_b_mem;
