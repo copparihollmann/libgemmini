@@ -60,7 +60,14 @@ inline float mx_product_quantize_trunc(float x, int e_bits, int frac_bits) {
   int e;
   float m = frexpf(fabsf(x), &e);
   int E = e - 1;
-  if (E < -16) return 0.0f;   // MxFPMul PROD_FLOOR: products below 2^-16 flush to zero
+  // A full-BF16 PE retains E4M3 subnormal products (e.g. 2^-9 * 2^-9).
+  // Keep the legacy floor for every lower-precision product profile.
+#ifdef GEMMINI_MX_BF16_ARITH
+  const bool full_bf16_product = e_bits == 8 && frac_bits == 7;
+#else
+  const bool full_bf16_product = false;
+#endif
+  if (E < -16 && !full_bf16_product) return 0.0f;
   float scale = (float)(1 << frac_bits);
   float frac = 2.0f * m - 1.0f;
   float frac_q = floorf(frac * scale) / scale;

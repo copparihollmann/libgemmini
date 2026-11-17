@@ -37,6 +37,12 @@ REGISTER_EXTENSION(gemmini_bf16_dim8, []() { return new gemmini_t; })
 #else
 REGISTER_EXTENSION(gemmini_bf16_dim16, []() { return new gemmini_t; })
 #endif
+#elif defined(GEMMINI_MX_BF16_ARITH)   // MX mesh with full BF16 multipliers and adders (MxE4M3LutBf16Dim*)
+#if GEMMINI_DIM == 32
+REGISTER_EXTENSION(gemmini_mxbf16_dim32, []() { return new gemmini_t; })
+#else
+REGISTER_EXTENSION(gemmini_mxbf16_dim16, []() { return new gemmini_t; })
+#endif
 #elif defined(GEMMINI_E4M3_NATIVE_QUAD)
 REGISTER_EXTENSION(gemmini_dim32q, []() { return new gemmini_t; })   // native E4M3 quad, 64-B spad rows
 #elif GEMMINI_DIM == 32
@@ -1530,6 +1536,59 @@ void gemmini_t::mx_loop_managed_luts(uint16_t I, uint16_t J) {
 }
 
 void gemmini_t::mx_loop_ws_dram(reg_t rs1, reg_t rs2) {
+#ifdef GEMMINI_MX_BF16_ARITH
+  // Direct E3M2 single-lane DRAM loops were added to RTL after this model.
+  // Functional implementation for non-transposed BF16 output. Keep the shared
+  // logical shadow accumulator across the FP4, FP6 and FP8 format groups.
+  if (gemmini_state.mx_act_fmt == 1 && gemmini_state.mx_wgt_fmt == 1 &&
+      !gemmini_state.mx_lut_a_loaded && !gemmini_state.mx_lut_b_loaded &&
+      !gemmini_state.loop_ws_A_lut && !gemmini_state.loop_ws_B_lut &&
+      !gemmini_state.mx_fp8_altfmt && !gemmini_state.mx_wgt_altfmt) {
+    using namespace mx;
+    if (gemmini_state.mx_out_fmt != 3 || (rs2 & 7) || gemmini_state.loop_ws_pad_I ||
+        gemmini_state.loop_ws_pad_J || gemmini_state.loop_ws_pad_K || gemmini_state.loop_ws_D ||
+        !gemmini_state.loop_ws_A || !gemmini_state.loop_ws_B || !gemmini_state.loop_ws_A_sc ||
+        !gemmini_state.loop_ws_B_sc)
+      throw std::runtime_error(
+          "Direct E3M2 model requires explicit DRAM operands/scales, BF16, no padding/D");
+    const size_t M = gemmini_state.loop_ws_I * DIM;
+    const size_t N = gemmini_state.loop_ws_J * DIM;
+    const size_t K = gemmini_state.loop_ws_K * DIM;
+    if (!(rs1 & 1))
+      gemmini_state.mx_smem.assign(M * N, 0);
+    if (gemmini_state.mx_smem.size() < M * N)
+      throw std::runtime_error("Direct E3M2 accumulation shape mismatch");
+    for (size_t kt = 0; kt < K; kt += DIM)
+      for (size_t m = 0; m < M; ++m)
+        for (size_t n = 0; n < N; ++n) {
+          float sum = 0;
+          for (size_t k = kt; k < kt + DIM; ++k) {
+            float a = fp6_e3m2_decode(read_from_dram<uint8_t>(
+                gemmini_state.loop_ws_A + m * gemmini_state.loop_ws_A_stride + k));
+            float b = fp6_e3m2_decode(read_from_dram<uint8_t>(
+                gemmini_state.loop_ws_B + k * gemmini_state.loop_ws_B_stride + n));
+            float prod = mx_product_quantize_trunc(a * b, 8, 7);
+            sum = fp_add_exact(fp_quantize_rne(sum, 8, 7), fp_quantize_rne(prod, 8, 7), 8, 7);
+          }
+          int sa = read_from_dram<uint8_t>(gemmini_state.loop_ws_A_sc +
+                                           (kt / 32) * gemmini_state.loop_ws_A_sc_stride + m);
+          int sb = read_from_dram<uint8_t>(gemmini_state.loop_ws_B_sc +
+                                           (kt / 32) * gemmini_state.loop_ws_B_sc_stride + n);
+          int se = std::max(0, std::min(254, sa + sb - 127));
+          float scaled = bf16_round(sum * fpe8m0_decode(se));
+          size_t idx = m * N + n;
+          gemmini_state.mx_smem[idx] =
+              f32_to_bf16_rne(bf16_accum_add(bf16_to_f32(gemmini_state.mx_smem[idx]), scaled));
+        }
+    if (gemmini_state.loop_ws_C)
+      for (size_t m = 0; m < M; ++m)
+        for (size_t n = 0; n < N; ++n)
+          p->get_mmu()->store<uint16_t>(gemmini_state.loop_ws_C +
+                                            2 * (m * gemmini_state.loop_ws_C_stride + n),
+                                        gemmini_state.mx_smem[m * N + n]);
+    return;
+  }
+#endif
   const bool ex_accumulate = rs1 & 1;
   const uint8_t a_spad_id = (rs1 >> 18) & 0b11;
   const uint8_t b_spad_id = (rs1 >> 16) & 0b11;
@@ -1643,13 +1702,17 @@ void gemmini_t::mx_loop_ws_spad(reg_t rs1, reg_t rs2) {
     return gemmini_state.mx_wgt_altfmt ? fp6_e2m3_decode(code) : fp6_e3m2_decode(code);
   };
 
+#ifdef GEMMINI_MX_BF16_ARITH
+  const int prod_e = 8, prod_m = 7;   // full BF16 products (ConfigsFP bf16Arith)
+#else
   const int prod_e = 4, prod_m = 3;
+#endif
   // Mesh acc precision ramp, matching ConfigsFP dim{16,32}MxFPConfig meshAccPrecisionList
   // (Python frac = Scala sig-1). Lanes 0-15 = the dim16 ramp; lanes 16+ = bf16 (8,7).
   int8_t acc_e[DIM], acc_m[DIM];
   for (int kk = 0; kk < DIM; kk++) {
-#if GEMMINI_DIM <= 8
-    acc_e[kk] = 8; acc_m[kk] = 7;   // DIM<=8: ALL rows bf16 (design assumption -- no reduced-precision ramp)
+#if GEMMINI_DIM <= 8 || defined(GEMMINI_MX_BF16_ARITH)
+    acc_e[kk] = 8; acc_m[kk] = 7;   // DIM<=8 and full-BF16 models use BF16 in every row.
 #else
     if      (kk < 8)  { acc_e[kk] = 4; acc_m[kk] = 4; }
     else if (kk < 10) { acc_e[kk] = 4; acc_m[kk] = 5; }

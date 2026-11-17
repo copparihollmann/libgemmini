@@ -63,6 +63,42 @@ to `mx_loop_ws_spad` instead of the legacy CISC loop; `rs1` is unused
 and in `rs2` the upper 32 bits are the C-side spad word offset, while
 `rs2[5:0]` is the existing skip-mask byte.
 
+### Full-BF16 MX arithmetic
+
+Build `libgemmini_mxbf16_dim16.so` or `libgemmini_mxbf16_dim32.so` for an MX
+mesh whose multipliers and accumulators use full BF16 arithmetic:
+
+```sh
+make libgemmini_mxbf16_dim16.so
+spike --extlib=./libgemmini_mxbf16_dim16.so --extension=gemmini_mxbf16_dim16 program.elf
+```
+
+This mode retains small products, including E4M3 `0x01 * 0x01 = 2^-18`
+(BF16 `0x3680`). Reduced-precision product profiles retain their existing
+`2^-16` floor; selecting the full-BF16 model does not change those profiles.
+
+Direct E3M2 operands are supported for non-transposed DRAM loops with explicit
+operand scales and BF16 output. They accumulate into the same logical shadow
+buffer as adjacent FP4 and FP8 groups. Padding, a D operand, alternate FP6/FP8
+formats and requantized output are outside this direct path; unsupported
+controls are rejected rather than interpreted as another layout.
+
+The standalone arithmetic regression requires only a host C++ compiler:
+
+```sh
+make check-mx-products
+```
+
+It checks all 64,516 finite E4M3FN input pairs in both legacy and full-BF16 modes,
+including subnormals and the unchanged reduced-precision floor. Spike's cycle
+counts remain functional-model diagnostics, not FPGA performance measurements.
+This is a software arithmetic contract, not qualification of every FP8 code on
+a particular image. The supplied DIM16 MAC maps FP8 codes 121–127 and 249–255
+to NaN, while codes 120/248 represent finite 256. The software E4M3FN decoder
+retains its existing finite values for codes 121–126 and 249–254. Captured
+block-normalized model operands avoid those codes; arbitrary encoded bytes
+must be checked against the target image's encoding domain separately.
+
 ### CONFIG_EX changes (funct 0, CONFIG_EX subtype, `rs1[1:0] == 0b00`)
 
 `gemmini_extended3_config_ex` now packs four MX format fields into
