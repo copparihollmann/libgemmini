@@ -109,7 +109,7 @@ spike handler reads:
 | `rs1` bits | Field | Meaning |
 |------------|-------|---------|
 | `[5]`     | `uselut`  | When 1, the MX kernel takes the FP6 LUT path. |
-| `[11:10]` | `act_fmt` | A-side / activation format: 0 = FP8 E4M3, 1 = FP6 E3M2 (LUT-indexed), 2 = FP4 E2M1. Selects the matmul kernel. |
+| `[11:10]` | `act_fmt` | A-side / activation format: 0 = FP8 E4M3, 1 = FP6 E3M2 (direct bytes in the full-BF16 DRAM path with no operand LUTs; LUT indices when LUTs are enabled), 2 = FP4 E2M1. Selects the matmul kernel. |
 | `[13:12]` | `wgt_fmt` | B-side / weight format (same encoding). |
 | `[15:14]` | `out_fmt` | Output format: 0 = FP8 E4M3 packed, 1 = FP6 (4-bit LUT indices), 2 = FP4 E2M1 packed, 3 = BF16. Selects whether a requant post-pass runs and which projection it uses. |
 
